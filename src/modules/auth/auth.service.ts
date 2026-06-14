@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from 'crypto';
 import {
   ConflictException,
   Injectable,
@@ -12,7 +13,28 @@ import { PrismaService } from '../prisma/prisma.service';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 
-type SafeUser = Omit<User, 'password'>;
+export type SafeUser = Omit<User, 'password'>;
+
+export interface AccessJwtPayload {
+  sub: string;
+  email: string;
+  role: string;
+  type: 'access';
+}
+
+export interface RefreshJwtPayload {
+  sub: string;
+  email: string;
+  role: string;
+  type: 'refresh';
+  jti: string;
+}
+
+export interface TokenPairResponse {
+  user: SafeUser;
+  access_token: string;
+  refresh_token: string;
+}
 
 @Injectable()
 export class AuthService {
@@ -22,15 +44,12 @@ export class AuthService {
     private readonly configService: ConfigService,
   ) {}
 
-  async register(registerDto: RegisterDto) {
+  async register(registerDto: RegisterDto): Promise<TokenPairResponse> {
     const user = await this.createUser(registerDto);
-    return {
-      user,
-      access_token: await this.generateToken(user),
-    };
+    return this.issueTokenPair(user);
   }
 
-  async login(loginDto: LoginDto) {
+  async login(loginDto: LoginDto): Promise<TokenPairResponse> {
     const user = await this.prisma.user.findUnique({
       where: { email: loginDto.email },
     });
@@ -47,11 +66,71 @@ export class AuthService {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    const { password: _, ...safeUser } = user;
-    return {
-      user: safeUser,
-      access_token: await this.generateToken(user),
-    };
+    return this.issueTokenPair(this.omitPassword(user));
+  }
+
+  async refresh(refreshToken: string): Promise<TokenPairResponse> {
+    const payload = await this.verifyRefreshToken(refreshToken);
+    const tokenHash = this.hashToken(refreshToken);
+
+    const storedToken = await this.prisma.refreshToken.findUnique({
+      where: { tokenHash },
+    });
+
+    if (
+      !storedToken ||
+      storedToken.revokedAt ||
+      storedToken.expiresAt <= new Date() ||
+      storedToken.userId !== payload.sub
+    ) {
+      throw new UnauthorizedException('Invalid refresh token');
+    }
+
+    await this.prisma.refreshToken.update({
+      where: { id: storedToken.id },
+      data: { revokedAt: new Date() },
+    });
+
+    const user = await this.getProfile(payload.sub);
+    return this.issueTokenPair(user);
+  }
+
+  async logout(refreshToken: string): Promise<void> {
+    const payload = await this.verifyRefreshToken(refreshToken);
+    const tokenHash = this.hashToken(refreshToken);
+
+    const storedToken = await this.prisma.refreshToken.findUnique({
+      where: { tokenHash },
+    });
+
+    if (
+      !storedToken ||
+      storedToken.revokedAt ||
+      storedToken.userId !== payload.sub
+    ) {
+      throw new UnauthorizedException('Invalid refresh token');
+    }
+
+    await this.prisma.refreshToken.update({
+      where: { id: storedToken.id },
+      data: { revokedAt: new Date() },
+    });
+  }
+
+  async getProfile(userId: string): Promise<SafeUser> {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) {
+      throw new UnauthorizedException('User not found');
+    }
+    return this.omitPassword(user);
+  }
+
+  private async issueTokenPair(user: SafeUser): Promise<TokenPairResponse> {
+    const access_token = await this.signAccessToken(user);
+    const refresh_token = await this.signRefreshToken(user);
+    await this.persistRefreshToken(user.id, refresh_token);
+
+    return { user, access_token, refresh_token };
   }
 
   private async createUser(dto: RegisterDto): Promise<SafeUser> {
@@ -65,8 +144,7 @@ export class AuthService {
           name: dto.name,
         },
       });
-      const { password: _, ...safeUser } = user;
-      return safeUser;
+      return this.omitPassword(user);
     } catch (error) {
       if (
         error instanceof Prisma.PrismaClientKnownRequestError &&
@@ -78,19 +156,89 @@ export class AuthService {
     }
   }
 
-  private async generateToken(user: Pick<User, 'id' | 'email' | 'role'>) {
-    return this.jwtService.signAsync(
-      {
-        sub: user.id,
-        email: user.email,
-        role: user.role,
+  private omitPassword(user: User): SafeUser {
+    const { password: _, ...safeUser } = user;
+    return safeUser;
+  }
+
+  private async signAccessToken(
+    user: Pick<User, 'id' | 'email' | 'role'>,
+  ): Promise<string> {
+    const payload: AccessJwtPayload = {
+      sub: user.id,
+      email: user.email,
+      role: user.role,
+      type: 'access',
+    };
+
+    return this.jwtService.signAsync(payload, {
+      secret: this.configService.get<string>('jwt.accessSecret'),
+      expiresIn: this.configService.get<string>(
+        'jwt.accessExpiresIn',
+      ) as StringValue,
+    });
+  }
+
+  private async signRefreshToken(
+    user: Pick<User, 'id' | 'email' | 'role'>,
+  ): Promise<string> {
+    const payload: RefreshJwtPayload = {
+      sub: user.id,
+      email: user.email,
+      role: user.role,
+      type: 'refresh',
+      jti: randomUUID(),
+    };
+
+    return this.jwtService.signAsync(payload, {
+      secret: this.configService.get<string>('jwt.refreshSecret'),
+      expiresIn: this.configService.get<string>(
+        'jwt.refreshExpiresIn',
+      ) as StringValue,
+    });
+  }
+
+  private async verifyRefreshToken(
+    refreshToken: string,
+  ): Promise<RefreshJwtPayload> {
+    try {
+      const payload = await this.jwtService.verifyAsync<RefreshJwtPayload>(
+        refreshToken,
+        {
+          secret: this.configService.get<string>('jwt.refreshSecret'),
+        },
+      );
+
+      if (payload.type !== 'refresh') {
+        throw new UnauthorizedException('Invalid refresh token');
+      }
+
+      return payload;
+    } catch {
+      throw new UnauthorizedException('Invalid refresh token');
+    }
+  }
+
+  private hashToken(token: string): string {
+    return createHash('sha256').update(token).digest('hex');
+  }
+
+  private async persistRefreshToken(
+    userId: string,
+    refreshToken: string,
+  ): Promise<void> {
+    const decoded = this.jwtService.decode(refreshToken) as { exp?: number };
+
+    if (!decoded?.exp) {
+      throw new UnauthorizedException('Invalid refresh token');
+    }
+
+    await this.prisma.refreshToken.create({
+      data: {
+        userId,
+        tokenHash: this.hashToken(refreshToken),
+        expiresAt: new Date(decoded.exp * 1000),
       },
-      {
-        secret: this.configService.get<string>('jwt.secret'),
-        expiresIn: this.configService.get<string>(
-          'jwt.expiresIn',
-        ) as StringValue,
-      },
-    );
+    });
   }
 }

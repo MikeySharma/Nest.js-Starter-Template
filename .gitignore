@@ -16,6 +16,12 @@ dock
 .DS_Store
 .env
 
+# Cursor IDE
+.cursor/
+
+# pnpm local store
+.pnpm-store/
+
 # Tests
 /coverage
 /.nyc_output
