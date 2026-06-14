@@ -14,6 +14,9 @@ export class UserResponseDto {
   @ApiProperty({ enum: Role, example: Role.USER })
   role: Role;
 
+  @ApiPropertyOptional({ example: '2026-06-14T12:00:00.000Z' })
+  emailVerifiedAt?: Date | null;
+
   @ApiProperty({ example: '2026-06-14T12:00:00.000Z' })
   createdAt: Date;
 
@@ -24,6 +27,17 @@ export class UserResponseDto {
 export class AuthResponseDto {
   @ApiProperty({ type: UserResponseDto })
   user: UserResponseDto;
+}
+
+export class RegisterResponseDto {
+  @ApiProperty({ type: UserResponseDto })
+  user: UserResponseDto;
+
+  @ApiProperty({
+    example:
+      'Registration successful. Please check your email to verify your account.',
+  })
+  message: string;
 }
 
 export class HealthResponseDto {

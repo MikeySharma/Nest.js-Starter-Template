@@ -1,6 +1,7 @@
-import { createHash, randomUUID } from 'crypto';
+import {  randomUUID } from 'crypto';
 import {
   ConflictException,
+  ForbiddenException,
   Injectable,
   UnauthorizedException,
 } from '@nestjs/common';
@@ -9,32 +10,18 @@ import { JwtService } from '@nestjs/jwt';
 import { Prisma, User } from '@prisma/client';
 import * as bcrypt from 'bcryptjs';
 import type { StringValue } from 'ms';
+import { hashToken } from '../../common/utils/hash-token.util';
 import { PrismaService } from '../prisma/prisma.service';
+import { EmailVerificationService } from './email-verification.service';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
-
-export type SafeUser = Omit<User, 'password'>;
-
-export interface AccessJwtPayload {
-  sub: string;
-  email: string;
-  role: string;
-  type: 'access';
-}
-
-export interface RefreshJwtPayload {
-  sub: string;
-  email: string;
-  role: string;
-  type: 'refresh';
-  jti: string;
-}
-
-export interface TokenPairResponse {
-  user: SafeUser;
-  access_token: string;
-  refresh_token: string;
-}
+import {
+  AccessJwtPayload,
+  RefreshJwtPayload,
+  RegisterResponse,
+  SafeUser,
+  TokenPairResponse,
+} from './types/auth.types';
 
 @Injectable()
 export class AuthService {
@@ -42,11 +29,17 @@ export class AuthService {
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
+    private readonly emailVerificationService: EmailVerificationService,
   ) {}
 
-  async register(registerDto: RegisterDto): Promise<TokenPairResponse> {
+  async register(registerDto: RegisterDto): Promise<RegisterResponse> {
     const user = await this.createUser(registerDto);
-    return this.issueTokenPair(user);
+    await this.emailVerificationService.createAndSendVerification(user);
+
+    return {
+      user,
+      message: 'Registration successful. Please check your email to verify your account.',
+    };
   }
 
   async login(loginDto: LoginDto): Promise<TokenPairResponse> {
@@ -66,12 +59,25 @@ export class AuthService {
       throw new UnauthorizedException('Invalid credentials');
     }
 
+    if (!user.emailVerifiedAt) {
+      throw new ForbiddenException('Email not verified');
+    }
+
     return this.issueTokenPair(this.omitPassword(user));
+  }
+
+  async verifyEmail(rawToken: string): Promise<TokenPairResponse> {
+    const user = await this.emailVerificationService.verifyEmail(rawToken);
+    return this.issueTokenPair(user);
+  }
+
+  async resendVerification(email: string): Promise<void> {
+    await this.emailVerificationService.resendVerification(email);
   }
 
   async refresh(refreshToken: string): Promise<TokenPairResponse> {
     const payload = await this.verifyRefreshToken(refreshToken);
-    const tokenHash = this.hashToken(refreshToken);
+    const tokenHash = hashToken(refreshToken);
 
     const storedToken = await this.prisma.refreshToken.findUnique({
       where: { tokenHash },
@@ -97,7 +103,7 @@ export class AuthService {
 
   async logout(refreshToken: string): Promise<void> {
     const payload = await this.verifyRefreshToken(refreshToken);
-    const tokenHash = this.hashToken(refreshToken);
+    const tokenHash = hashToken(refreshToken);
 
     const storedToken = await this.prisma.refreshToken.findUnique({
       where: { tokenHash },
@@ -122,7 +128,10 @@ export class AuthService {
     if (!user) {
       throw new UnauthorizedException('User not found');
     }
-    return this.omitPassword(user);
+
+    const safeUser = this.omitPassword(user);
+    this.emailVerificationService.ensureVerified(safeUser);
+    return safeUser;
   }
 
   private async issueTokenPair(user: SafeUser): Promise<TokenPairResponse> {
@@ -219,10 +228,6 @@ export class AuthService {
     }
   }
 
-  private hashToken(token: string): string {
-    return createHash('sha256').update(token).digest('hex');
-  }
-
   private async persistRefreshToken(
     userId: string,
     refreshToken: string,
@@ -236,7 +241,7 @@ export class AuthService {
     await this.prisma.refreshToken.create({
       data: {
         userId,
-        tokenHash: this.hashToken(refreshToken),
+        tokenHash: hashToken(refreshToken),
         expiresAt: new Date(decoded.exp * 1000),
       },
     });

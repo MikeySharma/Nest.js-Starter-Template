@@ -5,6 +5,7 @@ import {
   HttpCode,
   HttpStatus,
   Post,
+  Query,
   Req,
   Res,
   UnauthorizedException,
@@ -15,6 +16,7 @@ import {
   ApiBearerAuth,
   ApiCookieAuth,
   ApiCreatedResponse,
+  ApiForbiddenResponse,
   ApiNoContentResponse,
   ApiOkResponse,
   ApiOperation,
@@ -26,6 +28,7 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import {
   AuthResponseDto,
+  RegisterResponseDto,
   UserResponseDto,
 } from '../../common/dto/api-response.dto';
 import {
@@ -34,9 +37,12 @@ import {
   clearAuthCookies,
   setAuthCookies,
 } from './auth-cookies';
-import { AuthService, SafeUser } from './auth.service';
+import { AuthService } from './auth.service';
+import { SafeUser } from './types/auth.types';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
+import { ResendVerificationDto } from './dto/resend-verification.dto';
+import { VerifyEmailQueryDto } from './dto/verify-email.dto';
 
 @ApiTags('auth')
 @Controller('auth')
@@ -49,17 +55,37 @@ export class AuthController {
   @Post('register')
   @ApiOperation({ summary: 'Register a new user' })
   @ApiCreatedResponse({
-    type: AuthResponseDto,
-    description: 'User profile; access and refresh tokens are set as HttpOnly cookies',
+    type: RegisterResponseDto,
+    description:
+      'User profile and verification message; no auth cookies until email is verified',
   })
-  async register(
-    @Body() registerDto: RegisterDto,
+  register(@Body() registerDto: RegisterDto) {
+    return this.authService.register(registerDto);
+  }
+
+  @Get('verify-email')
+  @ApiOperation({ summary: 'Verify email address using token from email link' })
+  @ApiOkResponse({
+    type: AuthResponseDto,
+    description: 'Email verified; auth cookies are set',
+  })
+  @ApiUnauthorizedResponse({ description: 'Invalid verification token' })
+  async verifyEmail(
+    @Query() { token }: VerifyEmailQueryDto,
     @Res({ passthrough: true }) res: Response,
   ) {
     const { user, access_token, refresh_token } =
-      await this.authService.register(registerDto);
+      await this.authService.verifyEmail(token);
     setAuthCookies(res, this.jwtService, access_token, refresh_token);
     return { user };
+  }
+
+  @Post('resend-verification')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({ summary: 'Resend email verification link' })
+  @ApiNoContentResponse({ description: 'Verification email queued if account exists' })
+  resendVerification(@Body() { email }: ResendVerificationDto) {
+    return this.authService.resendVerification(email);
   }
 
   @Post('login')
@@ -69,6 +95,7 @@ export class AuthController {
     description: 'User profile; access and refresh tokens are set as HttpOnly cookies',
   })
   @ApiUnauthorizedResponse({ description: 'Invalid credentials' })
+  @ApiForbiddenResponse({ description: 'Email not verified' })
   async login(
     @Body() loginDto: LoginDto,
     @Res({ passthrough: true }) res: Response,

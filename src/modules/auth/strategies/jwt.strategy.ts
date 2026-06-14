@@ -4,10 +4,8 @@ import { PassportStrategy } from '@nestjs/passport';
 import { Request } from 'express';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { ACCESS_TOKEN_COOKIE } from '../auth-cookies';
-import {
-  AccessJwtPayload,
-  AuthService,
-} from '../auth.service';
+import { AuthService } from '../auth.service';
+import { AccessJwtPayload } from '../types/auth.types';
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
@@ -30,6 +28,12 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       throw new UnauthorizedException('Invalid access token');
     }
 
-    return this.authService.getProfile(payload.sub);
+    const user = await this.authService.getProfile(payload.sub);
+
+    if (!user.emailVerifiedAt) {
+      throw new UnauthorizedException('Email not verified');
+    }
+
+    return user;
   }
 }
